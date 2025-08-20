@@ -669,7 +669,7 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 	}
 
 	rb_io_t *fptr = NULL;
-	RB_IO_POINTER(args->io, fptr);
+	RB_IO_POINTER(args.io, fptr);
 	nl_errcheck(rd_fd_region(diag, &args, fptr));
 
 	st_foreach(args.table, NIL_P(addrs) ? st_to_hash : st_AND_hash, rv);
