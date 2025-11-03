@@ -1,20 +1,35 @@
 #include <ruby.h>
 #include <stdarg.h>
 #include <ruby/st.h>
+#include <ruby/version.h>
 #include "my_fileno.h"
+
 #ifdef __linux__
 
 #ifdef HAVE_RB_THREAD_IO_BLOCKING_REGION
-/* NOTE: ruby 3.5.0+ only */
+#  if RUBY_API_VERSION_CODE >= 30500
+#    define HAVE_NEWER_RB_THREAD_IO_BLOCKING_REGION
+#  else
+#    define HAVE_OLDER_RB_THREAD_IO_BLOCKING_REGION
+#  endif
+#endif
+
+#ifdef HAVE_NEWER_RB_THREAD_IO_BLOCKING_REGION
+/* ruby >= 3.5.0 */
 VALUE rb_thread_io_blocking_region(struct rb_io *ptr, rb_blocking_function_t *cb, void *data);
 #  define rd_fd_region(fn,data,io_ptr) \
 	rb_thread_io_blocking_region((io_ptr),(fn),(data))
+#elif defined(HAVE_OLDER_RB_THREAD_IO_BLOCKING_REGION)
+/* ruby >= 1.9.3 */
+VALUE rb_thread_io_blocking_region(rb_blocking_function_t *cb, void *data, int fd);
+#  define rd_fd_region(fn,data,fd) \
+	rb_thread_io_blocking_region((fn),(data),(fd))
 #elif defined(HAVE_RB_THREAD_CALL_WITHOUT_GVL) && \
 	defined(HAVE_RUBY_THREAD_H) && HAVE_RUBY_THREAD_H
 /* in case Ruby 2.0+ ever drops rb_thread_io_blocking_region: */
 #  include <ruby/thread.h>
 #  define COMPAT_FN (void *(*)(void *))
-#  define rd_fd_region(fn,data,io_ptr) \
+#  define rd_fd_region(fn,data,fd) \
 	rb_thread_call_without_gvl(COMPAT_FN(fn),(data),RUBY_UBF_IO,NULL)
 #else
 #  error Ruby <= 1.8 not supported
@@ -588,9 +603,13 @@ static VALUE tcp_stats(struct nogvl_args *args, VALUE addr)
 
 	memset(&args->stats, 0, sizeof(struct listen_stats));
 
+#ifdef HAVE_NEWER_RB_THREAD_IO_BLOCKING_REGION
 	rb_io_t *fptr = NULL;
 	RB_IO_POINTER(args->io, fptr);
 	nl_errcheck(rd_fd_region(diag, args, fptr));
+#else
+	nl_errcheck(rd_fd_region(diag, args, args->fd));
+#endif
 
 	return rb_listen_stats(&args->stats);
 }
@@ -668,9 +687,13 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 		         "addr must be an array of strings, a string, or nil");
 	}
 
+#ifdef HAVE_NEWER_RB_THREAD_IO_BLOCKING_REGION
 	rb_io_t *fptr = NULL;
 	RB_IO_POINTER(args.io, fptr);
 	nl_errcheck(rd_fd_region(diag, &args, fptr));
+#else
+	nl_errcheck(rd_fd_region(diag, &args, args.fd));
+#endif
 
 	st_foreach(args.table, NIL_P(addrs) ? st_to_hash : st_AND_hash, rv);
 	st_free_table(args.table);
