@@ -4,7 +4,18 @@
 #include "my_fileno.h"
 #ifdef __linux__
 
-#ifdef HAVE_RB_THREAD_IO_BLOCKING_REGION
+#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+/* Ruby 4.0+ */
+#  include <ruby/thread.h>
+#  include <ruby/io.h>
+VALUE rb_thread_io_blocking_call(rb_io_t *, rb_blocking_function_t *, void *, int);
+#  define COMPAT_FN (rb_blocking_function_t *)
+#  define rd_fd_region(fn,data,sock) ({ \
+	rb_io_t *fptr; \
+	GetOpenFile((sock), fptr); \
+	rb_thread_io_blocking_call(fptr, COMPAT_FN(fn), (data), RB_WAITFD_IN | RB_WAITFD_OUT); \
+})
+#elif defined(HAVE_RB_THREAD_IO_BLOCKING_REGION)
 /* Ruby 1.9.3 and 2.0.0 */
 VALUE rb_thread_io_blocking_region(rb_blocking_function_t *, void *, int);
 #  define rd_fd_region(fn,data,fd) \
@@ -63,6 +74,9 @@ struct nogvl_args {
 	struct iovec iov[3]; /* last iov holds inet_diag bytecode */
 	struct listen_stats stats;
 	int fd;
+#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+	VALUE sock; /* Ruby 4.0+ needs the IO object */
+#endif
 };
 
 #ifdef SOCK_CLOEXEC
@@ -586,7 +600,11 @@ static VALUE tcp_stats(struct nogvl_args *args, VALUE addr)
 	gen_bytecode(&args->iov[2], &query_addr);
 
 	memset(&args->stats, 0, sizeof(struct listen_stats));
+#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+	nl_errcheck(rd_fd_region(diag, args, args->sock));
+#else
 	nl_errcheck(rd_fd_region(diag, args, args->fd));
+#endif
 
 	return rb_listen_stats(&args->stats);
 }
@@ -630,6 +648,9 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 	if (NIL_P(sock))
 		sock = rb_funcall(cIDSock, id_new, 0);
 	args.fd = my_fileno(sock);
+#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+	args.sock = sock;
+#endif
 
 	switch (TYPE(addrs)) {
 	case T_STRING:
@@ -663,7 +684,11 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 		         "addr must be an array of strings, a string, or nil");
 	}
 
+#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+	nl_errcheck(rd_fd_region(diag, &args, args.sock));
+#else
 	nl_errcheck(rd_fd_region(diag, &args, args.fd));
+#endif
 
 	st_foreach(args.table, NIL_P(addrs) ? st_to_hash : st_AND_hash, rv);
 	st_free_table(args.table);

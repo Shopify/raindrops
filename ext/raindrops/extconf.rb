@@ -116,6 +116,7 @@ have_func("getpagesize", "unistd.h")
 have_func('rb_thread_call_without_gvl')
 have_func('rb_thread_blocking_region')
 have_func('rb_thread_io_blocking_region')
+have_func('rb_thread_io_blocking_call', 'ruby/thread.h')
 
 checking_for "GCC 4+ atomic builtins" do
   # we test CMPXCHG anyways even though we don't need it to filter out
