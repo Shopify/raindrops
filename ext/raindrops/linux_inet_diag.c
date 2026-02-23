@@ -203,7 +203,7 @@ static struct listen_stats *stats_for(addr2stats *a2s, struct inet_diag_msg *r)
 	socklen_t portlen = (socklen_t)sizeof("65535");
 	int n, absent;
 	const void *src = r->id.idiag_src;
-	char buf[INET6_ADDRSTRLEN];
+	char buf[1 + INET6_ADDRSTRLEN + 1 + sizeof("65535")];
 	size_t buf_len;
 	khint_t ki;
 
