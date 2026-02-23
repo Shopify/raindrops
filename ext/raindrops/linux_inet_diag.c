@@ -83,10 +83,12 @@ struct nogvl_args {
 	addr2stats *a2s;
 	struct iovec iov[3]; /* last iov holds inet_diag bytecode */
 	struct listen_stats stats;
+	VALUE buf;   /* pinned Ruby string backing iov[2] */
+	VALUE addrs;
+	VALUE rv;
+	VALUE sock;
 	int fd;
-#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
-	VALUE sock; /* Ruby 4.0+ needs the IO object */
-#endif
+	int close_sock_p;
 };
 
 #ifdef SOCK_CLOEXEC
@@ -454,6 +456,7 @@ out:
 			xfree(kh_val(args->a2s, ki));
 		}
 		a2s_destroy(args->a2s);
+		args->a2s = NULL; /* prevent double-free in cleanup */
 		errno = save_errno;
 	}
 	return (VALUE)err;
@@ -608,6 +611,65 @@ static int drop_placeholders(st_data_t k, st_data_t v, st_data_t ign)
 	return ST_CONTINUE;
 }
 
+/* ensure block: guaranteed cleanup for tcp_listener_stats */
+static VALUE tcp_listener_stats_cleanup(VALUE ptr)
+{
+	struct nogvl_args *args = (struct nogvl_args *)ptr;
+	khint_t ki;
+
+	if (!NIL_P(args->buf)) {
+		rb_str_unlocktmp(args->buf);
+		rb_str_resize(args->buf, 0);
+	}
+
+	if (args->a2s) {
+		for (ki = 0; ki < kh_end(args->a2s); ki++) {
+			if (!kh_exist(args->a2s, ki)) continue;
+			xfree(kh_key(args->a2s, ki));
+			xfree(kh_val(args->a2s, ki));
+		}
+		a2s_destroy(args->a2s);
+		args->a2s = NULL;
+	}
+
+	if (args->close_sock_p) {
+		args->close_sock_p = 0;
+		rb_io_close(args->sock);
+	}
+
+	return Qnil;
+}
+
+/* begin block: main logic for tcp_listener_stats */
+static VALUE tcp_listener_stats_body(VALUE ptr)
+{
+	struct nogvl_args *args = (struct nogvl_args *)ptr;
+	khint_t ki;
+	char *key;
+	struct listen_stats *stats;
+
+#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+	nl_errcheck(rd_fd_region(diag, args, args->sock));
+#else
+	nl_errcheck(rd_fd_region(diag, args, args->fd));
+#endif
+
+	for (ki = 0; ki < kh_end(args->a2s); ki++) {
+		if (!kh_exist(args->a2s, ki)) continue;
+		key = kh_key(args->a2s, ki);
+		stats = kh_val(args->a2s, ki);
+		if (stats->listener_p) {
+			VALUE k = remove_scope_id(key);
+			if (NIL_P(args->addrs) ||
+			    rb_hash_lookup(args->rv, k) == Qtrue)
+				rb_hash_aset(args->rv, k,
+					     rb_listen_stats(stats));
+		}
+	}
+
+	return Qnil;
+}
+
 /*
  * call-seq:
  *      Raindrops::Linux.tcp_listener_stats([addrs[, sock]]) => hash
@@ -623,34 +685,40 @@ static int drop_placeholders(st_data_t k, st_data_t v, st_data_t ign)
  */
 static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 {
-	VALUE rv = rb_hash_new();
 	struct nogvl_args args;
-	VALUE addrs, sock, buf;
-	khint_t ki;
-	struct listen_stats *stats;
-	char *key;
+	VALUE addrs, sock;
 
 	rb_scan_args(argc, argv, "02", &addrs, &sock);
+
+	args.rv = rb_hash_new();
+	args.addrs = addrs;
+	args.a2s = NULL;
+	args.buf = Qnil;
+	args.sock = Qnil;
+	args.close_sock_p = 0;
 
 	/*
 	 * allocating page_size instead of OP_LEN since we'll reuse the
 	 * buffer for recvmsg() later, we already checked for
 	 * OPLEN <= page_size at initialization
 	 */
-	buf = rb_str_buf_new(page_size);
+	args.buf = rb_str_buf_new(page_size);
+	rb_str_locktmp(args.buf); /* pin: prevent GC compaction */
 	args.iov[2].iov_len = OPLEN;
-	args.iov[2].iov_base = RSTRING_PTR(buf);
-	args.a2s = NULL;
-	sock = NIL_P(sock) ? rb_funcall(cIDSock, id_new, 0)
-			: rb_io_get_io(sock);
-	args.fd = my_fileno(sock);
-#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+	args.iov[2].iov_base = RSTRING_PTR(args.buf);
+
+	if (NIL_P(sock)) {
+		sock = rb_funcall(cIDSock, id_new, 0);
+		args.close_sock_p = 1;
+	} else {
+		sock = rb_io_get_io(sock);
+	}
 	args.sock = sock;
-#endif
+	args.fd = my_fileno(sock);
 
 	switch (TYPE(addrs)) {
 	case T_STRING:
-		rb_hash_aset(rv, addrs, tcp_stats(&args, addrs));
+		rb_hash_aset(args.rv, addrs, tcp_stats(&args, addrs));
 		goto out;
 	case T_ARRAY: {
 		long i;
@@ -659,7 +727,7 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 		if (len == 1) {
 			VALUE cur = rb_ary_entry(addrs, 0);
 
-			rb_hash_aset(rv, cur, tcp_stats(&args, cur));
+			rb_hash_aset(args.rv, cur, tcp_stats(&args, cur));
 			goto out;
 		}
 		for (i = 0; i < len; i++) {
@@ -667,7 +735,7 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 			VALUE cur = rb_ary_entry(addrs, i);
 
 			parse_addr(&check, cur);
-			rb_hash_aset(rv, cur, Qtrue /* placeholder */);
+			rb_hash_aset(args.rv, cur, Qtrue /* placeholder */);
 		}
 		/* fall through */
 	}
@@ -676,40 +744,27 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 		gen_bytecode_all(&args.iov[2]);
 		break;
 	default:
-		if (argc < 2) rb_io_close(sock);
+		rb_str_unlocktmp(args.buf);
+		rb_str_resize(args.buf, 0);
+		if (args.close_sock_p) rb_io_close(sock);
 		rb_raise(rb_eArgError,
 		         "addr must be an array of strings, a string, or nil");
 	}
 
-#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
-	nl_errcheck(rd_fd_region(diag, &args, args.sock));
-#else
-	nl_errcheck(rd_fd_region(diag, &args, args.fd));
-#endif
+	rb_ensure(tcp_listener_stats_body, (VALUE)&args,
+		  tcp_listener_stats_cleanup, (VALUE)&args);
 
-	/* no kh_foreach* in khashl.h (unlike original khash.h) */
-	for (ki = 0; ki < kh_end(args.a2s); ki++) {
-		if (!kh_exist(args.a2s, ki)) continue;
-		key = kh_key(args.a2s, ki);
-		stats = kh_val(args.a2s, ki);
-		if (stats->listener_p) {
-			VALUE k = remove_scope_id(key);
-			if (NIL_P(addrs) || rb_hash_lookup(rv, k) == Qtrue)
-				rb_hash_aset(rv, k, rb_listen_stats(stats));
-		}
-		xfree(key);
-		xfree(stats);
-	}
-	a2s_destroy(args.a2s);
+	if (RHASH_SIZE(args.rv) > 1)
+		rb_hash_foreach(args.rv, drop_placeholders, Qfalse);
 
-	if (RHASH_SIZE(rv) > 1)
-		rb_hash_foreach(rv, drop_placeholders, Qfalse);
+	return args.rv;
 
 out:
-	/* let GC deal with corner cases */
-	rb_str_resize(buf, 0);
-	if (argc < 2) rb_io_close(sock);
-	return rv;
+	/* single-address fast path: unpin buf manually */
+	rb_str_unlocktmp(args.buf);
+	rb_str_resize(args.buf, 0);
+	if (args.close_sock_p) rb_io_close(sock);
+	return args.rv;
 }
 
 void Init_raindrops_linux_inet_diag(void)
