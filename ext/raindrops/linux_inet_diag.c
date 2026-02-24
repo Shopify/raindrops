@@ -47,7 +47,7 @@ union any_addr {
 	struct sockaddr_in6 in6;
 };
 
-static size_t page_size;
+#define RCVBUF_SIZE 32768
 static unsigned g_seq;
 static VALUE cListenStats, cIDSock;
 static ID id_new;
@@ -69,6 +69,7 @@ struct nogvl_args {
 	VALUE addrs;
 	VALUE rv;
 	VALUE sock;
+	void *buf;
 	int fd;
 	int close_sock_p;
 };
@@ -384,7 +385,7 @@ static void prep_diag_args(
 static void prep_recvmsg_buf(struct nogvl_args *args)
 {
 	/* reuse buffer that was allocated for bytecode */
-	args->iov[0].iov_len = page_size;
+	args->iov[0].iov_len = RCVBUF_SIZE;
 	args->iov[0].iov_base = args->iov[2].iov_base;
 }
 
@@ -609,6 +610,11 @@ static VALUE tcp_listener_stats_cleanup(VALUE ptr)
 		args->table = NULL;
 	}
 
+	if (args->buf) {
+		xfree(args->buf);
+		args->buf = NULL;
+	}
+
 	if (args->close_sock_p) {
 		args->close_sock_p = 0;
 		rb_io_close(args->sock);
@@ -617,11 +623,46 @@ static VALUE tcp_listener_stats_cleanup(VALUE ptr)
 	return Qnil;
 }
 
-/* begin block: main logic for tcp_listener_stats */
+/* body block for rb_ensure: all tcp_listener_stats logic */
 static VALUE tcp_listener_stats_body(VALUE ptr)
 {
 	struct nogvl_args *args = (struct nogvl_args *)ptr;
 
+	switch (TYPE(args->addrs)) {
+	case T_STRING:
+		rb_hash_aset(args->rv, args->addrs,
+			     tcp_stats(args, args->addrs));
+		return Qnil;
+	case T_ARRAY: {
+		long i;
+		long len = RARRAY_LEN(args->addrs);
+
+		if (len == 1) {
+			VALUE cur = rb_ary_entry(args->addrs, 0);
+
+			rb_hash_aset(args->rv, cur, tcp_stats(args, cur));
+			return Qnil;
+		}
+		for (i = 0; i < len; i++) {
+			union any_addr check;
+			VALUE cur = rb_ary_entry(args->addrs, i);
+
+			parse_addr(&check, cur);
+			rb_hash_aset(args->rv, cur, Qtrue /* placeholder */);
+		}
+		/* fall through */
+	}
+	/* fall through */
+	case T_NIL:
+		args->table = st_init_strtable();
+		gen_bytecode_all(&args->iov[2]);
+		break;
+	default:
+		rb_raise(rb_eArgError,
+		         "addr must be an array of strings, a string, or nil");
+	}
+
+	/* multi-addr / nil path */
 #if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
 	nl_errcheck(rd_fd_region(diag, args, args->sock));
 #else
@@ -659,16 +700,17 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 	args.rv = rb_hash_new();
 	args.addrs = addrs;
 	args.table = NULL;
+	args.buf = NULL;
 	args.sock = Qnil;
 	args.close_sock_p = 0;
 
 	/*
-	 * allocating page_size instead of OP_LEN since we'll reuse the
-	 * buffer for recvmsg() later, we already checked for
-	 * OPLEN <= page_size at initialization
+	 * heap-allocate RCVBUF_SIZE since we reuse the buffer for
+	 * netlink recvmsg(); freed in tcp_listener_stats_cleanup
 	 */
+	args.buf = xmalloc(RCVBUF_SIZE);
 	args.iov[2].iov_len = OPLEN;
-	args.iov[2].iov_base = alloca(page_size);
+	args.iov[2].iov_base = args.buf;
 
 	if (NIL_P(sock)) {
 		sock = rb_funcall(cIDSock, id_new, 0);
@@ -676,42 +718,6 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 	}
 	args.sock = sock;
 	args.fd = my_fileno(sock);
-
-	switch (TYPE(addrs)) {
-	case T_STRING:
-		rb_hash_aset(args.rv, addrs, tcp_stats(&args, addrs));
-		if (args.close_sock_p) rb_io_close(sock);
-		return args.rv;
-	case T_ARRAY: {
-		long i;
-		long len = RARRAY_LEN(addrs);
-
-		if (len == 1) {
-			VALUE cur = rb_ary_entry(addrs, 0);
-
-			rb_hash_aset(args.rv, cur, tcp_stats(&args, cur));
-			if (args.close_sock_p) rb_io_close(sock);
-			return args.rv;
-		}
-		for (i = 0; i < len; i++) {
-			union any_addr check;
-			VALUE cur = rb_ary_entry(addrs, i);
-
-			parse_addr(&check, cur);
-			rb_hash_aset(args.rv, cur, Qtrue /* placeholder */);
-		}
-		/* fall through */
-	}
-	/* fall through */
-	case T_NIL:
-		args.table = st_init_strtable();
-		gen_bytecode_all(&args.iov[2]);
-		break;
-	default:
-		if (args.close_sock_p) rb_io_close(sock);
-		rb_raise(rb_eArgError,
-		         "addr must be an array of strings, a string, or nil");
-	}
 
 	rb_ensure(tcp_listener_stats_body, (VALUE)&args,
 		  tcp_listener_stats_cleanup, (VALUE)&args);
@@ -747,8 +753,6 @@ void Init_raindrops_linux_inet_diag(void)
 	rb_define_module_function(mLinux, "tcp_listener_stats",
 	                          tcp_listener_stats, -1);
 
-	page_size = getpagesize();
-
-	assert(OPLEN <= page_size && "bytecode OPLEN is not <= PAGE_SIZE");
+	_Static_assert(OPLEN <= RCVBUF_SIZE, "bytecode OPLEN exceeds RCVBUF_SIZE");
 }
 #endif /* __linux__ */
