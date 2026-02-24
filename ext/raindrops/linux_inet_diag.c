@@ -73,10 +73,11 @@ struct nogvl_args {
 	st_table *table;
 	struct iovec iov[3]; /* last iov holds inet_diag bytecode */
 	struct listen_stats stats;
+	VALUE addrs;
+	VALUE rv;
+	VALUE sock;
 	int fd;
-#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
-	VALUE sock; /* Ruby 4.0+ needs the IO object */
-#endif
+	int close_sock_p;
 };
 
 #ifdef SOCK_CLOEXEC
@@ -463,6 +464,7 @@ out:
 
 		st_foreach(args->table, st_free_data, 0);
 		st_free_table(args->table);
+		args->table = NULL; /* prevent double-free in cleanup */
 		errno = save_errno;
 	}
 	return (VALUE)err;
@@ -616,6 +618,44 @@ static int drop_placeholders(st_data_t k, st_data_t v, st_data_t ign)
 	return ST_CONTINUE;
 }
 
+/* ensure block: guaranteed cleanup for tcp_listener_stats */
+static VALUE tcp_listener_stats_cleanup(VALUE ptr)
+{
+	struct nogvl_args *args = (struct nogvl_args *)ptr;
+
+	if (args->table) {
+		st_foreach(args->table, st_free_data, 0);
+		st_free_table(args->table);
+		args->table = NULL;
+	}
+
+	if (args->close_sock_p) {
+		args->close_sock_p = 0;
+		rb_io_close(args->sock);
+	}
+
+	return Qnil;
+}
+
+/* begin block: main logic for tcp_listener_stats */
+static VALUE tcp_listener_stats_body(VALUE ptr)
+{
+	struct nogvl_args *args = (struct nogvl_args *)ptr;
+
+#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+	nl_errcheck(rd_fd_region(diag, args, args->sock));
+#else
+	nl_errcheck(rd_fd_region(diag, args, args->fd));
+#endif
+
+	st_foreach(args->table,
+		   NIL_P(args->addrs) ? st_to_hash : st_AND_hash, args->rv);
+	st_free_table(args->table);
+	args->table = NULL;
+
+	return Qnil;
+}
+
 /*
  * call-seq:
  *      Raindrops::Linux.tcp_listener_stats([addrs[, sock]]) => hash
@@ -631,11 +671,16 @@ static int drop_placeholders(st_data_t k, st_data_t v, st_data_t ign)
  */
 static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 {
-	VALUE rv = rb_hash_new();
 	struct nogvl_args args;
 	VALUE addrs, sock;
 
 	rb_scan_args(argc, argv, "02", &addrs, &sock);
+
+	args.rv = rb_hash_new();
+	args.addrs = addrs;
+	args.table = NULL;
+	args.sock = Qnil;
+	args.close_sock_p = 0;
 
 	/*
 	 * allocating page_size instead of OP_LEN since we'll reuse the
@@ -644,18 +689,19 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 	 */
 	args.iov[2].iov_len = OPLEN;
 	args.iov[2].iov_base = alloca(page_size);
-	args.table = NULL;
-	if (NIL_P(sock))
+
+	if (NIL_P(sock)) {
 		sock = rb_funcall(cIDSock, id_new, 0);
-	args.fd = my_fileno(sock);
-#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
+		args.close_sock_p = 1;
+	}
 	args.sock = sock;
-#endif
+	args.fd = my_fileno(sock);
 
 	switch (TYPE(addrs)) {
 	case T_STRING:
-		rb_hash_aset(rv, addrs, tcp_stats(&args, addrs));
-		return rv;
+		rb_hash_aset(args.rv, addrs, tcp_stats(&args, addrs));
+		if (args.close_sock_p) rb_io_close(sock);
+		return args.rv;
 	case T_ARRAY: {
 		long i;
 		long len = RARRAY_LEN(addrs);
@@ -663,15 +709,16 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 		if (len == 1) {
 			VALUE cur = rb_ary_entry(addrs, 0);
 
-			rb_hash_aset(rv, cur, tcp_stats(&args, cur));
-			return rv;
+			rb_hash_aset(args.rv, cur, tcp_stats(&args, cur));
+			if (args.close_sock_p) rb_io_close(sock);
+			return args.rv;
 		}
 		for (i = 0; i < len; i++) {
 			union any_addr check;
 			VALUE cur = rb_ary_entry(addrs, i);
 
 			parse_addr(&check, cur);
-			rb_hash_aset(rv, cur, Qtrue /* placeholder */);
+			rb_hash_aset(args.rv, cur, Qtrue /* placeholder */);
 		}
 		/* fall through */
 	}
@@ -680,25 +727,18 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 		gen_bytecode_all(&args.iov[2]);
 		break;
 	default:
+		if (args.close_sock_p) rb_io_close(sock);
 		rb_raise(rb_eArgError,
 		         "addr must be an array of strings, a string, or nil");
 	}
 
-#if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
-	nl_errcheck(rd_fd_region(diag, &args, args.sock));
-#else
-	nl_errcheck(rd_fd_region(diag, &args, args.fd));
-#endif
+	rb_ensure(tcp_listener_stats_body, (VALUE)&args,
+		  tcp_listener_stats_cleanup, (VALUE)&args);
 
-	st_foreach(args.table, NIL_P(addrs) ? st_to_hash : st_AND_hash, rv);
-	st_free_table(args.table);
+	if (RHASH_SIZE(args.rv) > 1)
+		rb_hash_foreach(args.rv, drop_placeholders, Qfalse);
 
-	if (RHASH_SIZE(rv) > 1)
-		rb_hash_foreach(rv, drop_placeholders, Qfalse);
-
-	/* let GC deal with corner cases */
-	if (argc < 2) rb_io_close(sock);
-	return rv;
+	return args.rv;
 }
 
 void Init_raindrops_linux_inet_diag(void)
