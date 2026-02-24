@@ -1,10 +1,8 @@
 require 'mkmf'
 require 'shellwords'
 
-dir_config('atomic_ops')
 have_func('mmap', 'sys/mman.h') or abort 'mmap() not found'
 have_func('munmap', 'sys/mman.h') or abort 'munmap() not found'
-have_func('rb_io_descriptor')
 
 $CPPFLAGS += " -D_GNU_SOURCE "
 have_func('mremap', 'sys/mman.h')
@@ -17,7 +15,7 @@ else
   }
 end
 
-$CPPFLAGS += " -D_BSD_SOURCE "
+$CPPFLAGS += " -D_DEFAULT_SOURCE "
 
 if have_type("struct tcp_info", headers)
   %w(
@@ -113,14 +111,20 @@ EOF
 end
 
 have_func("getpagesize", "unistd.h")
-have_func('rb_thread_call_without_gvl')
-have_func('rb_thread_blocking_region')
 have_func('rb_thread_io_blocking_region')
-have_func('rb_thread_io_blocking_call', 'ruby/thread.h')
 
-checking_for "GCC 4+ atomic builtins" do
-  # we test CMPXCHG anyways even though we don't need it to filter out
-  # ancient i386-only targets without CMPXCHG
+# Both rb_thread_io_blocking_region and rb_thread_io_blocking_call are
+# private Ruby APIs (not in public headers), so we forward-declare them
+# in the C code. The signature changed in Ruby 4.0:
+#   3.4: rb_thread_io_blocking_region(fn, data, fd)     — takes int fd
+#   4.0: rb_thread_io_blocking_call(fptr, fn, data, events) — takes rb_io_t*
+# Since these are private, have_func/try_compile can't reliably distinguish
+# them, so we use version detection.
+if RUBY_VERSION >= '4.0'
+  $defs.push("-DHAVE_RB_THREAD_IO_BLOCKING_CALL")
+end
+
+checking_for "GCC atomic builtins" do
   src = <<SRC
 int main(int argc, char * const argv[]) {
         unsigned long i = 0;
@@ -137,26 +141,8 @@ SRC
     $defs.push(format("-DHAVE_GCC_ATOMIC_BUILTINS"))
     true
   else
-    # some compilers still target 386 by default, but we need at least 486
-    # to run atomic builtins.
-    prev_cflags = $CFLAGS
-    $CFLAGS += " -march=i486 "
-    if try_link(src)
-      $defs.push(format("-DHAVE_GCC_ATOMIC_BUILTINS"))
-      true
-    else
-      $CFLAGS = prev_cflags
-      false
-    end
+    false
   end
-end or have_header('atomic_ops.h') or abort <<-SRC
-
-libatomic_ops is required if GCC 4+ is not used.
-See https://github.com/ivmai/libatomic_ops
-
-Users of Debian-based distros may run:
-
-  apt-get install libatomic-ops-dev
-SRC
+end or abort "GCC atomic builtins are required (Ruby 3.4+ implies a modern compiler)"
 create_header # generate extconf.h to avoid excessively long command-line
 create_makefile('raindrops_ext')

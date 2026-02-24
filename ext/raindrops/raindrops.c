@@ -7,13 +7,6 @@
 #include <string.h>
 #include "raindrops_atomic.h"
 
-#ifndef SIZET2NUM
-#  define SIZET2NUM(x) ULONG2NUM(x)
-#endif
-#ifndef NUM2SIZET
-#  define NUM2SIZET(x) NUM2ULONG(x)
-#endif
-
 /*
  * most modern CPUs have a cache-line size of 64 or 128.
  * We choose a bigger one by default since our structure is not
@@ -190,6 +183,7 @@ static void resize(struct raindrops *r, size_t new_rd_size)
  * we cannot use munmap + mmap to reallocate the buffer since it may
  * already be shared by other processes, so we just fail
  */
+NORETURN(static void resize(struct raindrops *, size_t));
 static void resize(struct raindrops *r, size_t new_rd_size)
 {
 	rb_raise(rb_eRangeError, "mremap(2) is not available");
@@ -366,10 +360,6 @@ void Init_raindrops_tcp_info(void);
 #ifndef _SC_NPROCESSORS_CONF
 #  if defined _SC_NPROCESSORS_ONLN
 #    define _SC_NPROCESSORS_CONF _SC_NPROCESSORS_ONLN
-#  elif defined _SC_NPROC_ONLN
-#    define _SC_NPROCESSORS_CONF _SC_NPROC_ONLN
-#  elif defined _SC_CRAY_NCPU
-#    define _SC_NPROCESSORS_CONF _SC_CRAY_NCPU
 #  endif
 #endif
 

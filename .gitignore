@@ -14,3 +14,6 @@ Makefile
 /LATEST
 /tmp
 /.rbx
+ext/raindrops/extconf.h
+ext/raindrops/raindrops_ext.bundle.dSYM
+ext/raindrops/raindrops_ext.bundle

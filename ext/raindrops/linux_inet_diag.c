@@ -1,8 +1,8 @@
 #include <ruby.h>
 #include <stdarg.h>
 #include <ruby/st.h>
-#include "my_fileno.h"
 #ifdef __linux__
+#include "my_fileno.h"
 
 #if defined(HAVE_RB_THREAD_IO_BLOCKING_CALL)
 /* Ruby 4.0+ */
@@ -16,19 +16,12 @@ VALUE rb_thread_io_blocking_call(rb_io_t *, rb_blocking_function_t *, void *, in
 	rb_thread_io_blocking_call(fptr, COMPAT_FN(fn), (data), RB_WAITFD_IN | RB_WAITFD_OUT); \
 })
 #elif defined(HAVE_RB_THREAD_IO_BLOCKING_REGION)
-/* Ruby 1.9.3 and 2.0.0 */
+/* Ruby 3.x */
 VALUE rb_thread_io_blocking_region(rb_blocking_function_t *, void *, int);
 #  define rd_fd_region(fn,data,fd) \
 	rb_thread_io_blocking_region((fn),(data),(fd))
-#elif defined(HAVE_RB_THREAD_CALL_WITHOUT_GVL) && \
-	defined(HAVE_RUBY_THREAD_H) && HAVE_RUBY_THREAD_H
-/* in case Ruby 2.0+ ever drops rb_thread_io_blocking_region: */
-#  include <ruby/thread.h>
-#  define COMPAT_FN (void *(*)(void *))
-#  define rd_fd_region(fn,data,fd) \
-	rb_thread_call_without_gvl(COMPAT_FN(fn),(data),RUBY_UBF_IO,NULL)
 #else
-#  error Ruby <= 1.8 not supported
+#  error Ruby 3.4+ or 4.0+ is required
 #endif
 
 #include <assert.h>
@@ -80,20 +73,7 @@ struct nogvl_args {
 	int close_sock_p;
 };
 
-#ifdef SOCK_CLOEXEC
-#  define my_SOCK_RAW (SOCK_RAW|SOCK_CLOEXEC)
-#  define FORCE_CLOEXEC(v) (v)
-#else
-#  define my_SOCK_RAW SOCK_RAW
-static VALUE FORCE_CLOEXEC(VALUE io)
-{
-	int fd = my_fileno(io);
-	int flags = fcntl(fd, F_SETFD, FD_CLOEXEC);
-	if (flags == -1)
-		rb_sys_fail("fcntl(F_SETFD, FD_CLOEXEC)");
-	return io;
-}
-#endif
+#define my_SOCK_RAW (SOCK_RAW|SOCK_CLOEXEC)
 
 /*
  * call-seq:
@@ -109,7 +89,7 @@ static VALUE ids_s_new(VALUE klass)
 	argv[1] = INT2NUM(my_SOCK_RAW);
 	argv[2] = INT2NUM(NETLINK_INET_DIAG);
 
-	return FORCE_CLOEXEC(rb_call_super(3, argv));
+	return rb_call_super(3, argv);
 }
 
 /* creates a Ruby ListenStats Struct based on our internal listen_stats */
@@ -226,10 +206,10 @@ static void bug_warn_nogvl(const char *fmt, ...)
 
 static struct listen_stats *stats_for(st_table *table, struct inet_diag_msg *r)
 {
-	char *host, *key, *port, *old_key;
-	size_t alloca_len;
+	char *host = NULL, *key = NULL, *port = NULL, *old_key;
+	size_t alloca_len = 0;
 	struct listen_stats *stats;
-	socklen_t hostlen;
+	socklen_t hostlen = 0;
 	socklen_t portlen = (socklen_t)sizeof("65535");
 	int n;
 	const void *src = r->id.idiag_src;
@@ -722,6 +702,7 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 		}
 		/* fall through */
 	}
+	/* fall through */
 	case T_NIL:
 		args.table = st_init_strtable();
 		gen_bytecode_all(&args.iov[2]);
