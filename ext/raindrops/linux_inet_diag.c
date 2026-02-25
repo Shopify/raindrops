@@ -628,6 +628,19 @@ static VALUE tcp_listener_stats_body(VALUE ptr)
 {
 	struct nogvl_args *args = (struct nogvl_args *)ptr;
 
+	/* allocate recv buffer and socket within ensure-protected scope */
+	if (!args->buf) {
+		args->buf = xmalloc(RCVBUF_SIZE);
+		args->iov[2].iov_len = OPLEN;
+		args->iov[2].iov_base = args->buf;
+	}
+
+	if (NIL_P(args->sock)) {
+		args->sock = rb_funcall(cIDSock, id_new, 0);
+		args->close_sock_p = 1;
+	}
+	args->fd = my_fileno(args->sock);
+
 	switch (TYPE(args->addrs)) {
 	case T_STRING:
 		rb_hash_aset(args->rv, args->addrs,
@@ -701,23 +714,9 @@ static VALUE tcp_listener_stats(int argc, VALUE *argv, VALUE self)
 	args.addrs = addrs;
 	args.table = NULL;
 	args.buf = NULL;
-	args.sock = Qnil;
+	args.sock = sock; /* may be Qnil; resolved inside body */
 	args.close_sock_p = 0;
-
-	/*
-	 * heap-allocate RCVBUF_SIZE since we reuse the buffer for
-	 * netlink recvmsg(); freed in tcp_listener_stats_cleanup
-	 */
-	args.buf = xmalloc(RCVBUF_SIZE);
-	args.iov[2].iov_len = OPLEN;
-	args.iov[2].iov_base = args.buf;
-
-	if (NIL_P(sock)) {
-		sock = rb_funcall(cIDSock, id_new, 0);
-		args.close_sock_p = 1;
-	}
-	args.sock = sock;
-	args.fd = my_fileno(sock);
+	args.fd = -1;
 
 	rb_ensure(tcp_listener_stats_body, (VALUE)&args,
 		  tcp_listener_stats_cleanup, (VALUE)&args);
